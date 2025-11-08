@@ -1,6 +1,11 @@
 ﻿import numpy as np
 import matplotlib.pyplot as plt
-from PBVI import mean_pbvi_whittle_index
+from PBVI import mean_pbvi_whittle_index, get_or_build_local_model_sigma
+from policy_iteration import (
+    whittle_index_pi_secant,
+    compute_value_and_advantage,
+    plot_value_and_advantage_direct,
+)
 from thompson_update import ts_soft_update_single, ts_labeled_update_single
 from smc_update import smc_update_single
 from closed_from_policy import ClosedFormPolicyController
@@ -15,9 +20,9 @@ POLICY_MAP = {
     2: "random",
     3: "myopic",
     4: "thompson_pbvi",
-    5: "none",
     6: "closed_form",
     7: "priority_index",
+    10: "pi_whittle",
 }
 POLICY_NAME_TO_ID = {v: k for k, v in POLICY_MAP.items()}
 
@@ -39,8 +44,8 @@ def simulate_rmab(
 ):
     rng = np.random.default_rng(seed)
     
-    A = np.array([[0.99, 0.0],
-              [0.0, 0.99]])  # decay or persistence matrix
+    A = np.array([[0.95, 0.0],
+              [0.0, 0.95]])  # decay or persistence matrix
 
     # Base transition matrix (shared template)
     base_transition_responsive = np.array([
@@ -120,8 +125,8 @@ def simulate_rmab(
     theta0_true_episodes = np.zeros((episodes, num_arms))
     theta1_true_episodes = np.zeros((episodes, num_arms))
 
-        # Initialize particles for SMC-based policies (SMC-PBVI and closed-form)
-    if policy_id == 0 or policy_id == 6 or policy_id == 7:
+    # Initialize particles for SMC-based policies (SMC-PBVI, closed-form, priority, pi_whittle)
+    if policy_id == 0 or policy_id == 6 or policy_id == 7 or policy_id == 10:
         def init_particles(size, th0=True):
             if th0:
                 th = rng.beta(1.0, 1.0, size=size)
@@ -140,6 +145,14 @@ def simulate_rmab(
         b0 = np.ones(num_arms)
         a1 = np.ones(num_arms)
         b1 = np.ones(num_arms)
+
+    # For policy 10: track end-of-episode curves for two random arms (no interpolation)
+    if policy_id == 10:
+        sel_pi10_arms = np.sort(rng.choice(num_arms, size=min(2, num_arms), replace=False))
+        pi10_last = {int(a): {"B": None, "V": None, "Adv": None} for a in sel_pi10_arms}
+    else:
+        sel_pi10_arms = None
+        pi10_last = None
 
     total_returns = []
 
@@ -179,6 +192,26 @@ def simulate_rmab(
                     theta0_mean=th0_mean,
                     theta1_mean=th1_mean,
                 )
+            
+            elif policy_id == 10:
+                # Whittle via policy-iteration on tiny local model per arm
+                th0_mean = np.sum(w_particles * theta0_particles, axis=1)
+                th1_mean = np.sum(w_particles * theta1_particles, axis=1)
+                num_arms_local = len(p_belief)
+                wis = np.empty(num_arms_local, dtype=float)
+                for i in range(num_arms_local):
+                    # Build deterministic sigma local model for speed
+                    B, P0, P1 = get_or_build_local_model_sigma(
+                        float(p_belief[i]), float(th0_mean[i]), float(th1_mean[i]), P01_all[i], P11_all[i], rng
+                    )
+                    lam_i = whittle_index_pi_secant(
+                        b_star=float(p_belief[i]), B=B, P0=P0, P1=P1, gamma=gamma,
+                        lam0=-1.0, lam1=1.0, tol=1e-6, max_it=20
+                    )
+                    wis[i] = lam_i
+                actions = np.zeros(num_arms_local, dtype=int)
+                active_idx = np.argpartition(-wis, budget-1)[:budget]
+                actions[active_idx] = 1
             elif policy_id == 7:
                 # Priority-index: posterior theta mean + exploration bonus
                 th0_mean = np.sum(w_particles * theta0_particles, axis=1)
@@ -211,10 +244,8 @@ def simulate_rmab(
                     verbose=verbose,
                     rng=rng,
                 )
-            elif policy_id == 5:
-                actions = np.zeros(num_arms, dtype=int)
             
-       
+            
             # Environment step
             rewards_t = 0.0
             for i in range(num_arms):
@@ -231,7 +262,7 @@ def simulate_rmab(
                 # Belief update
                 if a == 1:
                     # Active action: perfect health observation. only update theta estimation 
-                    if policy_id == 0 or policy_id == 6 or policy_id == 7:
+                    if policy_id in [0, 6, 7, 10]:
                             theta0_particles[i], theta1_particles[i], w_particles[i], _ = smc_update_single(
                             p=p_belief[i], action=a, y=y, P01=P01_all[i], P11=P11_all[i],
                             theta0=theta0_particles[i], theta1=theta1_particles[i], w=w_particles[i], 
@@ -241,7 +272,7 @@ def simulate_rmab(
                     p_belief[i] = float(s[i])
                 else:
                     # Passive action: update health belief and theta 
-                        if policy_id == 0 or policy_id == 6 or policy_id == 7:
+                        if policy_id in [0, 6, 7, 10]:
                             theta0_particles[i], theta1_particles[i], w_particles[i], p_belief[i] = smc_update_single(
                             p=p_belief[i], action=a, y=y, P01=P01_all[i], P11=P11_all[i],
                             theta0=theta0_particles[i], theta1=theta1_particles[i], w=w_particles[i], 
@@ -259,11 +290,12 @@ def simulate_rmab(
                             p_belief[i], a, y, theta_prior[i], P01_all[i], P11_all[i]
                         )
                         
-                # Accumulate reward (using true health state)
                 rewards_t += float(s[i])
-                # Evolve true theta with small Gaussian noise
+                # Evolve true theta with small Gaussian noise and keep 0 < th1 < th0 < 1
                 # epsilon = rng.normal(0.0, noise_std, size=2)
                 # theta_true[i] = np.clip(theta_true[i] @ A.T + epsilon, 1e-3, 1 - 1e-3)
+                # if theta_true[i, 1] >= theta_true[i, 0]:
+                #     theta_true[i, 1] = max(1e-3, theta_true[i, 0] - 1e-3)
 
             ep_return += (gamma ** t) * rewards_t
 
@@ -286,9 +318,13 @@ def simulate_rmab(
                     theta0_smc_episodes[ep] = th0_mean
                     theta1_smc_episodes[ep] = th1_mean
             elif policy_id == 4:
-                    theta0_smc_episodes[ep] = a0 / (a0 + b0)
-                    theta1_smc_episodes[ep] = a1 / (a1 + b1)
+                theta0_smc_episodes[ep] = a0 / (a0 + b0)
+                theta1_smc_episodes[ep] = a1 / (a1 + b1)
             elif policy_id == 7:
+                theta0_smc_episodes[ep] = np.sum(w_particles * theta0_particles, axis=1)
+                theta1_smc_episodes[ep] = np.sum(w_particles * theta1_particles, axis=1)
+            
+            elif policy_id == 10:
                 theta0_smc_episodes[ep] = np.sum(w_particles * theta0_particles, axis=1)
                 theta1_smc_episodes[ep] = np.sum(w_particles * theta1_particles, axis=1)
         # Always record true theta (end of episode snapshot)
@@ -298,6 +334,41 @@ def simulate_rmab(
         total_returns.append(ep_return)
         if verbose:
             print(f"Episode {ep+1} final return: {ep_return:.3f}")
+
+    # For policy 10: after each episode, snapshot end-of-episode curves for selected arms
+    # Compute at episode end using final beliefs and current theta means
+    if policy_id == 10 and sel_pi10_arms is not None:
+        th0_mean_final = np.sum(w_particles * theta0_particles, axis=1)
+        th1_mean_final = np.sum(w_particles * theta1_particles, axis=1)
+        for i in sel_pi10_arms:
+            i = int(i)
+            B_i, P0_i, P1_i = get_or_build_local_model_sigma(
+                float(p_belief[i]), float(th0_mean_final[i]), float(th1_mean_final[i]), P01_all[i], P11_all[i], rng
+            )
+            lam_i = whittle_index_pi_secant(
+                b_star=float(p_belief[i]), B=B_i, P0=P0_i, P1=P1_i, gamma=gamma,
+                lam0=-1.0, lam1=1.0, tol=1e-6, max_it=20
+            )
+            V_i, Q0_i, Q1_i, adv_i = compute_value_and_advantage(B_i, P0_i, P1_i, gamma, lam_i)
+            pi10_last[i]["B"] = B_i
+            pi10_last[i]["V"] = V_i
+            pi10_last[i]["Adv"] = adv_i
+
+    # For policy 10: after all episodes, plot the end-of-episode V and advantage for the selected arms
+    if policy_id == 10 and sel_pi10_arms is not None:
+        for a in sel_pi10_arms:
+            Bp = pi10_last[int(a)]["B"]
+            Vp = pi10_last[int(a)]["V"]
+            Ap = pi10_last[int(a)]["Adv"]
+            if Bp is None:
+                continue
+            plot_value_and_advantage_direct(
+                Bp, Vp, Ap,
+                out_path=f"pi10_arm{int(a)}_end_value_adv.png",
+                title=f"PI10 Arm {int(a)} End of last episode",
+                sigma_points=Bp,
+                n_plot_points=401,
+            )
 
     # Return per-episode true and estimated theta trajectories
     return total_returns, theta0_true_episodes, theta1_true_episodes, theta0_smc_episodes, theta1_smc_episodes
@@ -417,16 +488,17 @@ def update_belief_default(current_belief, action, observation, theta_true_i, P01
 def run_experiments():
     """Run comparison experiments"""
     num_arms_list = [40, 100]
-    policy_ids = [1, 2, 3, 5, 6, 7]
-    episodes = 100
-    horizon = 100
+    # Include policy 10 (policy-iteration Whittle); drop 'none' policy
+    policy_ids = [0, 1, 2, 3, 6, 10]
+    episodes = 20
+    horizon = 40
     gamma = 0.95
     seed = 42  # Fixed seed for reproducibility
 
     results = {}
     
     for N in num_arms_list:
-        budget_list = [int(N*0.1), int(N*0.2), int(N*0.3)]
+        budget_list = [int(N*0.2), int(N*0.3)]
         for B in budget_list:
             key = (N, B)
             results[key] = {}
@@ -474,9 +546,7 @@ def run_experiments():
                 
                 results[key][pol] = {
                     "mean": float(np.mean(returns)),
-                    "std": float(np.std(returns)),
                     "runtime_sec": elapsed,
-                    "returns": returns
                 }
                 print(f"{pol} - Average return: {results[key][pol]['mean']:.3f}")
 
